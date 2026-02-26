@@ -3,7 +3,7 @@ UFC raw data scraper (stage 1).
 
 This script creates exactly two datasets:
 1) data/raw_total_fight_data.csv   -> one row per fight (red/blue fight stats + fight metadata)
-2) data/raw_fighter_details.csv    -> one row per fighter (name, height_cm, weight_lbs, reach_in, stance, DOB)
+2) data/raw_fighter_details.csv    -> one row per fighter (name, height_cm, reach_in, stance, DOB)
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -86,6 +87,15 @@ class UFCRawDataScraper:
         self.session.headers.update(
             {"User-Agent": "Mozilla/5.0 (compatible; UFC-AI-Scraper/1.0)"}
         )
+        # Tracks why fights are dropped to help debugging and cross-verification.
+        self._last_meta_drop_reason = "unknown"
+        self._drop_counters: Dict[str, int] = {
+            "fight_stats_missing": 0,
+            "fight_meta_missing": 0,
+            "no_contest_or_dq": 0,
+            "unknown_weight_class": 0,
+            "fight_exceptions": 0,
+        }
 
     def _soup(self, url: str) -> BeautifulSoup:
         response = self.session.get(url, timeout=30)
@@ -94,8 +104,10 @@ class UFCRawDataScraper:
 
     def run(self):
         fight_df = self.scrape_raw_total_fight_data()
-        fight_df.to_csv(RAW_TOTAL_FIGHTS_PATH, sep=";", index=False)
+        # Use comma-delimited CSV for easier interoperability.
+        fight_df.to_csv(RAW_TOTAL_FIGHTS_PATH, index=False)
         print(f"Saved {len(fight_df)} fights -> {RAW_TOTAL_FIGHTS_PATH}")
+        print(f"Drop summary: {self._drop_counters}")
 
         fighters = sorted(
             set(fight_df["R_fighter"].dropna().tolist())
@@ -116,12 +128,14 @@ class UFCRawDataScraper:
             event_meta = self._get_event_meta(event_url)
             if event_meta is None:
                 continue
-            event_date, fight_links = event_meta
+            event_date, fight_rows = event_meta
             if event_date.year < self.start_year:
-                continue
+                # UFCStats lists completed events newest-first, so we can stop once
+                # we hit an older year during quick range-limited scrapes.
+                break
 
-            for fight_url in fight_links:
-                row = self._scrape_single_fight(fight_url, event_date)
+            for fight_row in fight_rows:
+                row = self._scrape_single_fight(fight_row, event_date)
                 if row is not None:
                     rows.append(row)
 
@@ -173,11 +187,13 @@ class UFCRawDataScraper:
             "B_GND_STR_landed",
             "R_GND_STR_pct",
             "B_GND_STR_pct",
-            "method",
+            "winner",
+            "win_type",
+            "finish_type",
+            "decision_type",
             "last_round",
             "format",
             "date",
-            "winner",
             "title_bout",
             "weight_class",
         ]
@@ -193,7 +209,9 @@ class UFCRawDataScraper:
                 links.append(a["href"])
         return links
 
-    def _get_event_meta(self, event_url: str) -> Optional[Tuple[datetime, List[str]]]:
+    def _get_event_meta(
+        self, event_url: str
+    ) -> Optional[Tuple[datetime, List[Dict[str, str]]]]:
         try:
             soup = self._soup(event_url)
         except Exception:
@@ -208,7 +226,7 @@ class UFCRawDataScraper:
         if pd.isna(event_date):
             return None
 
-        fight_links: List[str] = []
+        fight_rows: List[Dict[str, str]] = []
         for tr in soup.find_all(
             "tr",
             {
@@ -217,18 +235,49 @@ class UFCRawDataScraper:
         ):
             href = tr.get("data-link")
             if href:
-                fight_links.append(href)
+                tds = tr.find_all("td")
+                event_wl = tds[0].get_text(" ", strip=True) if len(tds) > 0 else ""
+                event_weight_class = tds[6].get_text(" ", strip=True) if len(tds) > 6 else ""
+                event_method = tds[7].get_text(" ", strip=True) if len(tds) > 7 else ""
+                event_round = tds[8].get_text(" ", strip=True) if len(tds) > 8 else ""
+                fight_rows.append(
+                    {
+                        "url": href,
+                        "event_wl": event_wl,
+                        "event_weight_class": event_weight_class,
+                        "event_method": event_method,
+                        "event_round": event_round,
+                    }
+                )
 
-        return event_date.to_pydatetime(), fight_links
+        return event_date.to_pydatetime(), fight_rows
 
-    def _scrape_single_fight(
-        self, fight_url: str, event_date: datetime
-    ) -> Optional[Dict]:
+    def _scrape_single_fight(self, fight_row: Dict[str, str], event_date: datetime) -> Optional[Dict]:
         try:
+            fight_url = fight_row.get("url", "")
+            if not fight_url:
+                self._drop_counters["fight_exceptions"] += 1
+                return None
             soup = self._soup(fight_url)
             fight_stats = self._parse_fight_stat_tables(soup)
-            fight_meta = self._parse_fight_meta(soup)
-            if fight_stats is None or fight_meta is None:
+            if fight_stats is None:
+                self._drop_counters["fight_stats_missing"] += 1
+                self._log_drop("fight_stats_missing", None, None, fight_url)
+                return None
+            fight_meta = self._parse_fight_meta(
+                soup=soup,
+                red_name=fight_stats.R_fighter,
+                blue_name=fight_stats.B_fighter,
+                event_hint=fight_row,
+            )
+            if fight_meta is None:
+                self._drop_counters["fight_meta_missing"] += 1
+                self._log_drop(
+                    self._last_meta_drop_reason,
+                    fight_stats.R_fighter,
+                    fight_stats.B_fighter,
+                    fight_url,
+                )
                 return None
 
             row = {
@@ -236,9 +285,24 @@ class UFCRawDataScraper:
                 **fight_meta,
                 "date": event_date.strftime("%Y-%m-%d"),
             }
+            if row.get("win_type") == "no_contest":
+                self._drop_counters["no_contest_or_dq"] += 1
+                self._log_drop(
+                    "no_contest_or_dq",
+                    fight_stats.R_fighter,
+                    fight_stats.B_fighter,
+                    fight_url,
+                )
+                return None
             return row
         except Exception:
+            self._drop_counters["fight_exceptions"] += 1
             return None
+
+    @staticmethod
+    def _log_drop(reason: str, red_name: Optional[str], blue_name: Optional[str], fight_url: str) -> None:
+        matchup = f"{red_name or 'Unknown'} vs {blue_name or 'Unknown'}"
+        print(f"DROPPED [{reason}] {matchup} | {fight_url}")
 
     def _parse_fight_stat_tables(self, soup: BeautifulSoup) -> Optional[FightStats]:
         tables = soup.find_all("tbody")
@@ -371,22 +435,71 @@ class UFCRawDataScraper:
             B_GND_STR_pct=self._pct_from_counts(b_ground_landed, b_ground_attempted),
         )
 
-    def _parse_fight_meta(self, soup: BeautifulSoup) -> Optional[Dict]:
+    def _parse_fight_meta(
+        self,
+        soup: BeautifulSoup,
+        red_name: str,
+        blue_name: str,
+        event_hint: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict]:
+        self._last_meta_drop_reason = "unknown"
         details_block = soup.find("div", {"class": "b-fight-details__content"})
         if details_block is None:
+            self._last_meta_drop_reason = "missing_details_block"
             return None
 
-        vals = []
-        for p in details_block.find_all("p", {"class": "b-fight-details__text"}):
-            txt = p.get_text(" ", strip=True)
-            txt = txt.replace("Method:", "").replace("Round:", "")
-            txt = txt.replace("Time:", "").replace("Time format:", "")
-            txt = txt.replace("Referee:", "").strip()
-            vals.append(txt)
-        if len(vals) < 4:
+        # UFCStats often renders Method/Round/Time/Time format in a single text line.
+        # Parse from the combined block text first, then fallback to per-line parsing.
+        block_text = details_block.get_text(" ", strip=True)
+        method_text = None
+        round_text = None
+        format_text = None
+        details_text = ""
+
+        method_match = re.search(r"Method:\s*(.*?)\s*Round:", block_text, flags=re.IGNORECASE)
+        round_match = re.search(r"Round:\s*([0-9]+)", block_text, flags=re.IGNORECASE)
+        format_match = re.search(
+            r"Time format:\s*(.*?)(?:\s*Referee:|\s*Details:|$)",
+            block_text,
+            flags=re.IGNORECASE,
+        )
+        details_match = re.search(r"Details:\s*(.*)$", block_text, flags=re.IGNORECASE)
+
+        if method_match:
+            method_text = method_match.group(1).strip()
+        if round_match:
+            round_text = round_match.group(1).strip()
+        if format_match:
+            format_text = format_match.group(1).strip()
+        if details_match:
+            details_text = details_match.group(1).strip()
+
+        if method_text is None or round_text is None or format_text is None:
+            for p in details_block.find_all("p", {"class": "b-fight-details__text"}):
+                raw = p.get_text(" ", strip=True)
+                lowered = raw.lower()
+                if lowered.startswith("method:"):
+                    method_text = raw.split(":", maxsplit=1)[1].strip()
+                elif lowered.startswith("round:"):
+                    round_text = raw.split(":", maxsplit=1)[1].strip()
+                elif lowered.startswith("time format:"):
+                    format_text = raw.split(":", maxsplit=1)[1].strip()
+                elif lowered.startswith("details:"):
+                    details_text = raw.split(":", maxsplit=1)[1].strip()
+
+        # Event row fallback for method/round if the fight-details block format shifts.
+        if event_hint:
+            if method_text is None:
+                method_text = event_hint.get("event_method", "").strip() or None
+            if round_text is None:
+                round_text = event_hint.get("event_round", "").strip() or None
+
+        if method_text is None or round_text is None or format_text is None:
+            self._last_meta_drop_reason = "missing_method_round_or_format"
             return None
 
-        winner = ""
+        status_by_name = self._extract_header_statuses(soup)
+        winner_name = ""
         for div in soup.find_all("div", {"class": "b-fight-details__person"}):
             status = div.find(
                 "i",
@@ -397,24 +510,137 @@ class UFCRawDataScraper:
             if status is not None:
                 h3 = div.find("h3", {"class": "b-fight-details__person-name"})
                 if h3:
-                    winner = h3.get_text(" ", strip=True)
+                    winner_name = h3.get_text(" ", strip=True)
 
         fight_title = soup.find("i", {"class": "b-fight-details__fight-title"})
         fight_type = fight_title.get_text(" ", strip=True) if fight_title else ""
 
-        title_bout = "Title Bout" in fight_type
+        # Ignore tournament title bouts (not UFC championship title bouts).
+        fight_type_lower = fight_type.lower()
+        title_bout = ("title bout" in fight_type_lower) and (
+            "tournament" not in fight_type_lower
+        )
         weight_class = self._extract_weight_class(fight_type)
+        if weight_class is None and event_hint:
+            weight_class = self._normalize_event_weight_class(
+                event_hint.get("event_weight_class", "")
+            )
         if weight_class is None:
+            self._drop_counters["unknown_weight_class"] += 1
+            self._last_meta_drop_reason = "unknown_weight_class"
             return None
+        winner_side, win_type, finish_type, decision_type = self._classify_result(
+            method_text=method_text,
+            details_text=details_text,
+            winner_name=winner_name,
+            red_name=red_name,
+            blue_name=blue_name,
+            red_status=status_by_name.get(red_name, ""),
+            blue_status=status_by_name.get(blue_name, ""),
+            event_wl=(event_hint or {}).get("event_wl", ""),
+        )
 
         return {
-            "method": vals[0],
-            "last_round": self._to_int(vals[1]),
-            "format": vals[3],
-            "winner": winner,
+            "winner": winner_side,
+            "win_type": win_type,
+            "finish_type": finish_type,
+            "decision_type": decision_type,
+            "last_round": self._to_int(round_text),
+            "format": self._format_to_round_count(format_text),
             "title_bout": title_bout,
             "weight_class": weight_class,
         }
+
+    @staticmethod
+    def _classify_result(
+        method_text: str,
+        details_text: str,
+        winner_name: str,
+        red_name: str,
+        blue_name: str,
+        red_status: str,
+        blue_status: str,
+        event_wl: str,
+    ) -> Tuple[str, str, Optional[str], Optional[str]]:
+        method = str(method_text).strip().lower()
+        details = str(details_text).strip().lower()
+        red_status = str(red_status).strip().upper()
+        blue_status = str(blue_status).strip().upper()
+        event_wl = str(event_wl).strip().lower()
+
+        # Primary source for draw/NC is the top status badges (W/L/D/NC).
+        if event_wl == "nc":
+            return "draw", "no_contest", None, None
+        if event_wl == "draw":
+            winner_side = "draw"
+        elif event_wl == "win":
+            winner_side = "red"
+        else:
+            winner_side = None
+        if red_status == "NC" or blue_status == "NC":
+            return "draw", "no_contest", None, None
+        if red_status == "D" or blue_status == "D":
+            winner_side = "draw"
+        elif red_status == "W":
+            winner_side = "red"
+        elif blue_status == "W":
+            winner_side = "blue"
+        elif winner_side is not None:
+            pass
+        elif "draw" in method:
+            winner_side = "draw"
+        elif winner_name == red_name:
+            winner_side = "red"
+        elif winner_name == blue_name:
+            winner_side = "blue"
+        else:
+            winner_side = "draw"
+
+        # Method-level backup for no contest.
+        if "no contest" in method or "overturned" in method:
+            return winner_side, "no_contest", None, None
+        # Explicitly remove DQ fights from dataset.
+        if "dq" in method or "disqualification" in method:
+            return winner_side, "no_contest", None, None
+
+        if "decision" in method or "draw" in method:
+            decision_type = None
+            if "unanimous" in method or "u-dec" in method:
+                decision_type = "unanimous"
+            elif "majority" in method or "majority" in details or "m-dec" in method:
+                decision_type = "majority"
+            elif "split" in method or "split" in details or "s-dec" in method:
+                decision_type = "split"
+            return winner_side, "decision", None, decision_type
+
+        if "submission" in method:
+            return winner_side, "finish", "SUB", None
+
+        # Include doctor stoppage under KO/TKO as requested.
+        if "ko/tko" in method or "tko" in method or "doctor" in method:
+            return winner_side, "finish", "KO/TKO", None
+
+        # Other non-decision endings (e.g. retirement) are grouped under KO/TKO
+        # for this first version of the schema.
+        return winner_side, "finish", "KO/TKO", None
+
+    @staticmethod
+    def _extract_header_statuses(soup: BeautifulSoup) -> Dict[str, str]:
+        status_by_name: Dict[str, str] = {}
+        for div in soup.find_all("div", {"class": "b-fight-details__person"}):
+            name_node = div.find("h3", {"class": "b-fight-details__person-name"})
+            if not name_node:
+                continue
+            fighter_name = name_node.get_text(" ", strip=True)
+
+            status_node = div.find(
+                "i", class_=lambda c: c and "b-fight-details__person-status" in c
+            )
+            status_text = ""
+            if status_node:
+                status_text = status_node.get_text(" ", strip=True).upper()
+            status_by_name[fighter_name] = status_text
+        return status_by_name
 
     @staticmethod
     def _extract_weight_class(fight_type: str) -> Optional[str]:
@@ -438,6 +664,44 @@ class UFCRawDataScraper:
                 return weight_class
         if "Catch Weight" in text or "Catchweight" in text:
             return "Catchweight"
+        return None
+
+    @staticmethod
+    def _normalize_event_weight_class(weight_text: str) -> Optional[str]:
+        text = str(weight_text).strip()
+        if not text:
+            return None
+        known_classes = [
+            "Women's Strawweight",
+            "Women's Bantamweight",
+            "Women's Featherweight",
+            "Women's Flyweight",
+            "Lightweight",
+            "Welterweight",
+            "Middleweight",
+            "Light Heavyweight",
+            "Heavyweight",
+            "Featherweight",
+            "Bantamweight",
+            "Flyweight",
+            "Catchweight",
+        ]
+        for weight_class in known_classes:
+            if weight_class.lower() in text.lower():
+                return weight_class
+        return None
+
+    @staticmethod
+    def _format_to_round_count(format_text: str) -> Optional[int]:
+        """
+        Convert UFCStats format text (e.g. '5 Rnd (5-5-5-5-5)') to just round count.
+        """
+        text = str(format_text).strip()
+        match = re.match(r"^(\d+)\s*Rnd", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        if "No Time Limit".lower() in text.lower():
+            return 1
         return None
 
     @staticmethod
@@ -517,7 +781,6 @@ class UFCRawDataScraper:
                     {
                         "name": name,
                         "height_cm": None,
-                        "weight_lbs": None,
                         "reach_in": None,
                         "stance": None,
                         "DOB": None,
@@ -531,7 +794,6 @@ class UFCRawDataScraper:
                     {
                         "name": name,
                         "height_cm": None,
-                        "weight_lbs": None,
                         "reach_in": None,
                         "stance": None,
                         "DOB": None,
@@ -546,7 +808,6 @@ class UFCRawDataScraper:
             columns=[
                 "name",
                 "height_cm",
-                "weight_lbs",
                 "reach_in",
                 "stance",
                 "DOB",
@@ -608,10 +869,9 @@ class UFCRawDataScraper:
         if len(values) < 5:
             return None
 
-        height_raw, weight_raw, reach_raw, stance_raw, dob_raw = values
+        height_raw, _, reach_raw, stance_raw, dob_raw = values
         return {
             "height_cm": self._height_to_cm(height_raw),
-            "weight_lbs": self._weight_to_lbs(weight_raw),
             "reach_in": self._reach_to_inches(reach_raw),
             "stance": stance_raw if stance_raw not in {"", "--"} else None,
             "DOB": self._normalize_dob(dob_raw),
@@ -631,16 +891,6 @@ class UFCRawDataScraper:
             except ValueError:
                 return None
         return None
-
-    @staticmethod
-    def _weight_to_lbs(weight: str) -> Optional[float]:
-        text = str(weight).replace("lbs.", "").replace("lbs", "").strip()
-        if text in {"", "--", "nan", "None"}:
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            return None
 
     @staticmethod
     def _reach_to_inches(reach: str) -> Optional[float]:
@@ -664,5 +914,5 @@ class UFCRawDataScraper:
 
 
 if __name__ == "__main__":
-    scraper = UFCRawDataScraper(start_year=2010)
+    scraper = UFCRawDataScraper(start_year=2025)
     scraper.run()
