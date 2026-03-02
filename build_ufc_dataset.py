@@ -209,6 +209,9 @@ class UFCRawDataScraper:
         cleaned = df[reach_ok & height_ok & age_ok & stance_ok & (~both_debut)].reset_index(
             drop=True
         )
+        # Ages are required above, so cast them to integer type.
+        cleaned["R_age"] = pd.to_numeric(cleaned["R_age"], errors="raise").astype(int)
+        cleaned["B_age"] = pd.to_numeric(cleaned["B_age"], errors="raise").astype(int)
         dropped = len(df) - len(cleaned)
         cleaned.to_csv(FINAL_DATA_PATH, index=False)
         print(f"Cleaned data.csv: removed {dropped} rows, kept {len(cleaned)} rows.")
