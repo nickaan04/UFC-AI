@@ -8,7 +8,8 @@ This script creates exactly two datasets:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import re
@@ -26,6 +27,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 RAW_TOTAL_FIGHTS_PATH = DATA_DIR / "raw_total_fight_data.csv"
 RAW_FIGHTER_DETAILS_PATH = DATA_DIR / "raw_fighter_details.csv"
+FINAL_DATA_PATH = DATA_DIR / "data.csv"
 
 
 @dataclass
@@ -78,6 +80,27 @@ class FightStats:
     B_GND_STR_pct: Optional[float]
 
 
+@dataclass
+class FighterHistory:
+    fights: int = 0
+    wins: int = 0
+    losses: int = 0
+    draws: int = 0
+    current_win_streak: int = 0
+    current_lose_streak: int = 0
+    total_time_fought_seconds: int = 0
+    total_title_bouts: int = 0
+    win_by_MD: int = 0
+    win_by_SD: int = 0
+    win_by_UD: int = 0
+    win_by_KO: int = 0
+    win_by_SUB: int = 0
+    hero_sum: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    hero_count: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    opp_sum: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    opp_count: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+
 class UFCRawDataScraper:
     EVENTS_URL = "http://ufcstats.com/statistics/events/completed?page=all"
 
@@ -103,6 +126,25 @@ class UFCRawDataScraper:
         return BeautifulSoup(response.text, "html.parser")
 
     def run(self):
+        # If comprehensive data already exists, do not scrape again.
+        # Only apply row-quality cleanup requested by the project.
+        if FINAL_DATA_PATH.exists():
+            print(f"Found existing file -> {FINAL_DATA_PATH}")
+            self.clean_data_csv()
+            return
+
+        # If raw files already exist, reuse them to build data.csv without scraping.
+        if RAW_TOTAL_FIGHTS_PATH.exists() and RAW_FIGHTER_DETAILS_PATH.exists():
+            print("Found existing raw files, rebuilding data.csv without scraping...")
+            fight_df = pd.read_csv(RAW_TOTAL_FIGHTS_PATH)
+            fighter_df = pd.read_csv(RAW_FIGHTER_DETAILS_PATH)
+            data_df = self.build_comprehensive_data(fight_df, fighter_df)
+            data_df.to_csv(FINAL_DATA_PATH, index=False)
+            print(f"Saved {len(data_df)} matchups -> {FINAL_DATA_PATH}")
+            self.clean_data_csv()
+            return
+
+        # Stage 1: scrape raw fight and fighter tables.
         fight_df = self.scrape_raw_total_fight_data()
         # Use comma-delimited CSV for easier interoperability.
         fight_df.to_csv(RAW_TOTAL_FIGHTS_PATH, index=False)
@@ -116,6 +158,60 @@ class UFCRawDataScraper:
         fighter_df = self.scrape_raw_fighter_details(fighters)
         fighter_df.to_csv(RAW_FIGHTER_DETAILS_PATH, index=False)
         print(f"Saved {len(fighter_df)} fighters -> {RAW_FIGHTER_DETAILS_PATH}")
+
+        # Stage 2: compile pre-fight matchup features for model training.
+        data_df = self.build_comprehensive_data(fight_df, fighter_df)
+        data_df.to_csv(FINAL_DATA_PATH, index=False)
+        print(f"Saved {len(data_df)} matchups -> {FINAL_DATA_PATH}")
+        self.clean_data_csv()
+
+    def clean_data_csv(self) -> None:
+        """
+        Remove matchup rows where either fighter is missing required profile fields.
+        """
+        if not FINAL_DATA_PATH.exists():
+            print(f"No existing {FINAL_DATA_PATH} to clean.")
+            return
+
+        df = pd.read_csv(FINAL_DATA_PATH)
+        required_columns = [
+            "R_reach",
+            "B_reach",
+            "R_stance",
+            "B_stance",
+            "R_height",
+            "B_height",
+            "R_age",
+            "B_age",
+            "R_total_time_fought_seconds",
+            "B_total_time_fought_seconds",
+        ]
+        missing_required = [col for col in required_columns if col not in df.columns]
+        if missing_required:
+            raise ValueError(f"data.csv missing required columns for cleaning: {missing_required}")
+
+        # Reach must be present for both fighters.
+        reach_ok = df["R_reach"].notna() & df["B_reach"].notna()
+        # Height and age must be present for both fighters.
+        height_ok = df["R_height"].notna() & df["B_height"].notna()
+        age_ok = df["R_age"].notna() & df["B_age"].notna()
+        # Stance must be non-null and non-empty for both fighters.
+        stance_ok = (
+            df["R_stance"].fillna("").astype(str).str.strip().ne("")
+            & df["B_stance"].fillna("").astype(str).str.strip().ne("")
+        )
+        # Drop rows where both fighters are debuting (inferred by zero total fight time).
+        both_debut = (
+            pd.to_numeric(df["R_total_time_fought_seconds"], errors="coerce").fillna(0).eq(0)
+            & pd.to_numeric(df["B_total_time_fought_seconds"], errors="coerce").fillna(0).eq(0)
+        )
+
+        cleaned = df[reach_ok & height_ok & age_ok & stance_ok & (~both_debut)].reset_index(
+            drop=True
+        )
+        dropped = len(df) - len(cleaned)
+        cleaned.to_csv(FINAL_DATA_PATH, index=False)
+        print(f"Cleaned data.csv: removed {dropped} rows, kept {len(cleaned)} rows.")
 
     # ----------------------
     # Fight-level scraping
@@ -192,6 +288,7 @@ class UFCRawDataScraper:
             "finish_type",
             "decision_type",
             "last_round",
+            "last_round_time",
             "format",
             "date",
             "title_bout",
@@ -453,11 +550,17 @@ class UFCRawDataScraper:
         block_text = details_block.get_text(" ", strip=True)
         method_text = None
         round_text = None
+        time_text = None
         format_text = None
         details_text = ""
 
         method_match = re.search(r"Method:\s*(.*?)\s*Round:", block_text, flags=re.IGNORECASE)
         round_match = re.search(r"Round:\s*([0-9]+)", block_text, flags=re.IGNORECASE)
+        time_match = re.search(
+            r"Time:\s*([0-9]+:[0-9]{2})",
+            block_text,
+            flags=re.IGNORECASE,
+        )
         format_match = re.search(
             r"Time format:\s*(.*?)(?:\s*Referee:|\s*Details:|$)",
             block_text,
@@ -469,12 +572,14 @@ class UFCRawDataScraper:
             method_text = method_match.group(1).strip()
         if round_match:
             round_text = round_match.group(1).strip()
+        if time_match:
+            time_text = time_match.group(1).strip()
         if format_match:
             format_text = format_match.group(1).strip()
         if details_match:
             details_text = details_match.group(1).strip()
 
-        if method_text is None or round_text is None or format_text is None:
+        if method_text is None or round_text is None or format_text is None or time_text is None:
             for p in details_block.find_all("p", {"class": "b-fight-details__text"}):
                 raw = p.get_text(" ", strip=True)
                 lowered = raw.lower()
@@ -482,6 +587,8 @@ class UFCRawDataScraper:
                     method_text = raw.split(":", maxsplit=1)[1].strip()
                 elif lowered.startswith("round:"):
                     round_text = raw.split(":", maxsplit=1)[1].strip()
+                elif lowered.startswith("time:"):
+                    time_text = raw.split(":", maxsplit=1)[1].strip()
                 elif lowered.startswith("time format:"):
                     format_text = raw.split(":", maxsplit=1)[1].strip()
                 elif lowered.startswith("details:"):
@@ -494,7 +601,7 @@ class UFCRawDataScraper:
             if round_text is None:
                 round_text = event_hint.get("event_round", "").strip() or None
 
-        if method_text is None or round_text is None or format_text is None:
+        if method_text is None or round_text is None or format_text is None or time_text is None:
             self._last_meta_drop_reason = "missing_method_round_or_format"
             return None
 
@@ -546,6 +653,7 @@ class UFCRawDataScraper:
             "finish_type": finish_type,
             "decision_type": decision_type,
             "last_round": self._to_int(round_text),
+            "last_round_time": self._normalize_round_time(time_text),
             "format": self._format_to_round_count(format_text),
             "title_bout": title_bout,
             "weight_class": weight_class,
@@ -705,6 +813,16 @@ class UFCRawDataScraper:
         return None
 
     @staticmethod
+    def _normalize_round_time(time_text: str) -> Optional[str]:
+        """
+        Keep round time in MM:SS format for raw_total_fight_data.
+        """
+        text = str(time_text).strip()
+        if not re.match(r"^[0-9]+:[0-9]{2}$", text):
+            return None
+        return text
+
+    @staticmethod
     def _flatten_row_cells(row) -> List[str]:
         values = []
         for td in row.find_all("td"):
@@ -767,6 +885,239 @@ class UFCRawDataScraper:
             return int(mins) * 60 + int(secs)
         except ValueError:
             return None
+
+    # ----------------------
+    # Comprehensive data.csv builder
+    # ----------------------
+    def build_comprehensive_data(
+        self, raw_fights: pd.DataFrame, raw_fighters: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Build final matchup dataset where each row uses PRE-FIGHT history only.
+        """
+        fights = raw_fights.copy()
+        fights["date"] = pd.to_datetime(fights["date"], errors="coerce")
+        fights = fights[fights["date"].notna()].sort_values("date").reset_index(drop=True)
+
+        # Ensure numeric fighter stat columns are numeric; keep NaN when not applicable.
+        stat_pairs = self._get_numeric_stat_pairs(fights)
+
+        fighters = raw_fighters.copy()
+        fighter_lookup = fighters.set_index("name").to_dict("index") if not fighters.empty else {}
+
+        history: Dict[str, FighterHistory] = defaultdict(FighterHistory)
+        rows: List[Dict] = []
+
+        for row in fights.itertuples(index=False):
+            red_name = getattr(row, "R_fighter")
+            blue_name = getattr(row, "B_fighter")
+            date = getattr(row, "date")
+            red_hist = history[red_name]
+            blue_hist = history[blue_name]
+
+            out_row: Dict = {}
+            out_row["R_fighter"] = red_name
+            out_row["B_fighter"] = blue_name
+            out_row["date"] = pd.to_datetime(date, errors="coerce").strftime("%Y-%m-%d")
+
+            # Static fighter attributes known pre-fight.
+            self._add_fighter_static_features(
+                out_row, prefix="R", fighter_name=red_name, fight_date=date, fighter_lookup=fighter_lookup
+            )
+            self._add_fighter_static_features(
+                out_row, prefix="B", fighter_name=blue_name, fight_date=date, fighter_lookup=fighter_lookup
+            )
+
+            # Historical averages and cumulative counters BEFORE current fight.
+            self._add_history_features(out_row, prefix="R", hist=red_hist, stat_bases=stat_pairs)
+            self._add_history_features(out_row, prefix="B", hist=blue_hist, stat_bases=stat_pairs)
+
+            # Targets for current fight.
+            out_row["winner"] = getattr(row, "winner")
+            out_row["win_type"] = getattr(row, "win_type")
+            out_row["finish_type"] = getattr(row, "finish_type")
+            out_row["decision_type"] = getattr(row, "decision_type")
+            out_row["last_round"] = getattr(row, "last_round")
+            out_row["format"] = getattr(row, "format")
+            out_row["title_bout"] = getattr(row, "title_bout")
+            out_row["weight_class"] = getattr(row, "weight_class")
+
+            rows.append(out_row)
+
+            # Update history AFTER emitting row so no leakage from current fight.
+            fight_seconds = self._estimate_fight_seconds(row)
+            self._update_history(
+                hist=red_hist,
+                is_red=True,
+                row=row,
+                stat_pairs=stat_pairs,
+                fight_seconds=fight_seconds,
+            )
+            self._update_history(
+                hist=blue_hist,
+                is_red=False,
+                row=row,
+                stat_pairs=stat_pairs,
+                fight_seconds=fight_seconds,
+            )
+
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _get_numeric_stat_pairs(fights: pd.DataFrame) -> List[str]:
+        """
+        Determine fighter-vs-opponent comparable numeric stat suffixes from raw fights.
+        Example suffixes: KD, SIG_STR_landed, TD_pct, ...
+        """
+        suffixes: List[str] = []
+        for col in fights.columns:
+            if not col.startswith("R_") or col == "R_fighter":
+                continue
+            suffix = col[2:]
+            b_col = f"B_{suffix}"
+            if b_col not in fights.columns:
+                continue
+
+            fights[col] = pd.to_numeric(fights[col], errors="coerce")
+            fights[b_col] = pd.to_numeric(fights[b_col], errors="coerce")
+            if fights[col].notna().any() or fights[b_col].notna().any():
+                suffixes.append(suffix)
+        return suffixes
+
+    def _add_fighter_static_features(
+        self,
+        out_row: Dict,
+        prefix: str,
+        fighter_name: str,
+        fight_date: pd.Timestamp,
+        fighter_lookup: Dict[str, Dict],
+    ) -> None:
+        info = fighter_lookup.get(fighter_name, {})
+        out_row[f"{prefix}_height"] = info.get("height_cm")
+        out_row[f"{prefix}_reach"] = info.get("reach_in")
+        out_row[f"{prefix}_stance"] = info.get("stance")
+        out_row[f"{prefix}_age"] = self._calculate_age(info.get("DOB"), fight_date)
+
+    @staticmethod
+    def _calculate_age(dob: Optional[str], fight_date: pd.Timestamp) -> Optional[int]:
+        if dob is None or pd.isna(fight_date):
+            return None
+        dob_dt = pd.to_datetime(dob, errors="coerce")
+        if pd.isna(dob_dt):
+            return None
+        return int((fight_date - dob_dt).days // 365.25)
+
+    @staticmethod
+    def _avg_or_nan(total: float, count: int) -> Optional[float]:
+        if count <= 0:
+            return None
+        return total / count
+
+    def _add_history_features(
+        self, out_row: Dict, prefix: str, hist: FighterHistory, stat_bases: List[str]
+    ) -> None:
+        for base in stat_bases:
+            out_row[f"{prefix}_avg_{base}"] = self._avg_or_nan(
+                hist.hero_sum[base], hist.hero_count[base]
+            )
+            out_row[f"{prefix}_avg_opp_{base}"] = self._avg_or_nan(
+                hist.opp_sum[base], hist.opp_count[base]
+            )
+
+        out_row[f"{prefix}_current_lose_streak"] = hist.current_lose_streak
+        out_row[f"{prefix}_current_win_streak"] = hist.current_win_streak
+        out_row[f"{prefix}_draws"] = hist.draws
+        out_row[f"{prefix}_wins"] = hist.wins
+        out_row[f"{prefix}_losses"] = hist.losses
+        out_row[f"{prefix}_total_time_fought_seconds"] = hist.total_time_fought_seconds
+        out_row[f"{prefix}_total_title_bouts"] = hist.total_title_bouts
+        out_row[f"{prefix}_win_by_MD"] = hist.win_by_MD
+        out_row[f"{prefix}_win_by_SD"] = hist.win_by_SD
+        out_row[f"{prefix}_win_by_UD"] = hist.win_by_UD
+        out_row[f"{prefix}_win_by_KO/TKO"] = hist.win_by_KO
+        out_row[f"{prefix}_win_by_SUB"] = hist.win_by_SUB
+
+    def _estimate_fight_seconds(self, row) -> int:
+        """
+        Calculate exact fight duration using:
+        (last_round - 1) * 300 + last_round_time_seconds
+        """
+        last_round = getattr(row, "last_round", None)
+        last_round_time = getattr(row, "last_round_time", None)
+
+        last_round = pd.to_numeric(last_round, errors="coerce")
+        if pd.isna(last_round):
+            return 0
+        last_round_time_seconds = self._time_to_seconds(last_round_time)
+        if last_round_time_seconds is None:
+            return int(max(last_round - 1, 0) * 300)
+        return int(max(last_round - 1, 0) * 300 + last_round_time_seconds)
+
+    def _update_history(
+        self,
+        hist: FighterHistory,
+        is_red: bool,
+        row,
+        stat_pairs: List[str],
+        fight_seconds: int,
+    ) -> None:
+        winner = str(getattr(row, "winner")).lower()
+        won = (winner == "red" and is_red) or (winner == "blue" and not is_red)
+        lost = (winner == "red" and not is_red) or (winner == "blue" and is_red)
+        drew = winner == "draw"
+
+        if won:
+            hist.wins += 1
+            hist.current_win_streak += 1
+            hist.current_lose_streak = 0
+        elif lost:
+            hist.losses += 1
+            hist.current_lose_streak += 1
+            hist.current_win_streak = 0
+        elif drew:
+            hist.draws += 1
+            hist.current_win_streak = 0
+            hist.current_lose_streak = 0
+
+        if bool(getattr(row, "title_bout")):
+            hist.total_title_bouts += 1
+        hist.total_time_fought_seconds += fight_seconds
+
+        # Win-method counters are only incremented for winning fighter.
+        if won:
+            win_type = str(getattr(row, "win_type")).lower()
+            finish_type = str(getattr(row, "finish_type"))
+            decision_type = str(getattr(row, "decision_type")).lower()
+
+            if win_type == "decision":
+                if decision_type == "majority":
+                    hist.win_by_MD += 1
+                elif decision_type == "split":
+                    hist.win_by_SD += 1
+                elif decision_type == "unanimous":
+                    hist.win_by_UD += 1
+            elif win_type == "finish":
+                if finish_type == "KO/TKO":
+                    hist.win_by_KO += 1
+                elif finish_type == "SUB":
+                    hist.win_by_SUB += 1
+
+        # Update running stat sums/counts, ignoring null cells.
+        for base in stat_pairs:
+            r_val = pd.to_numeric(getattr(row, f"R_{base}"), errors="coerce")
+            b_val = pd.to_numeric(getattr(row, f"B_{base}"), errors="coerce")
+
+            hero_val = r_val if is_red else b_val
+            opp_val = b_val if is_red else r_val
+
+            if pd.notna(hero_val):
+                hist.hero_sum[base] += float(hero_val)
+                hist.hero_count[base] += 1
+            if pd.notna(opp_val):
+                hist.opp_sum[base] += float(opp_val)
+                hist.opp_count[base] += 1
+
+        hist.fights += 1
 
     # ----------------------
     # Fighter-level scraping
@@ -914,5 +1265,5 @@ class UFCRawDataScraper:
 
 
 if __name__ == "__main__":
-    scraper = UFCRawDataScraper(start_year=2025)
+    scraper = UFCRawDataScraper(start_year=2001)
     scraper.run()

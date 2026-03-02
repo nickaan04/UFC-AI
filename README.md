@@ -2,13 +2,14 @@
 
 ## What this project currently does
 
-- Scrapes UFCStats event/fight data for fights from 2010 onward.
+- Scrapes UFCStats event/fight data for fights from 2001 onward.
 - Builds `data/raw_total_fight_data.csv` (one row per fight, red/blue fight stats + metadata).
   - Excludes: `referee`, `location`
   - Excludes fight rows marked as `NC`/`No Contest` and `DQ`
   - `title_bout` excludes tournament title bouts
 - Builds `data/raw_fighter_details.csv` (one row per fighter with:
   `name`, `height_cm`, `reach_in`, `stance`, `DOB`).
+- Builds `data/data.csv` (one row per matchup with pre-fight red/blue features and current-fight targets)
 
 ## Files
 
@@ -30,3 +31,4 @@ python3 build_ufc_dataset.py
 
 - `data/raw_total_fight_data.csv`
 - `data/raw_fighter_details.csv`
+- `data/data.csv`
