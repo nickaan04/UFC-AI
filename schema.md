@@ -52,17 +52,17 @@ Stats:
 - `GND_STR_landed` -> significant ground strikes landed
 - `GND_STR_pct` -> ground strike landed/attempted percentage
 
-## Cumulative pre-fight counters
+## Cumulative pre-fight counters and rates
 
 - `current_lose_streak` (`int`) -> current consecutive losses entering the fight
 - `current_win_streak` (`int`) -> current consecutive wins entering the fight
-- `draws` (`int`) -> career draw count before current fight
-- `wins` (`int`) -> career win count before current fight
-- `losses` (`int`) -> career loss count before current fight
+- `draws` (`float`) -> pre-fight draw rate (`prior_draws / prior_fights`)
+- `wins` (`float`) -> pre-fight win rate (`prior_wins / prior_fights`)
+- `losses` (`float`) -> pre-fight loss rate (`prior_losses / prior_fights`)
 - `total_time_fought_seconds` (`int`) -> total prior fight time in seconds
-- `total_title_bouts` (`int`) -> number of title bouts before current fight
-- `win_by_MD` (`int`) -> prior wins by majority decision
-- `win_by_SD` (`int`) -> prior wins by split decision
-- `win_by_UD` (`int`) -> prior wins by unanimous decision
-- `win_by_KO/TKO` (`int`) -> prior wins by KO/TKO
-- `win_by_SUB` (`int`) -> prior wins by submission
+- `total_title_bouts` (`float`) -> title-bout rate (`prior_title_bouts / prior_fights`)
+- `win_by_MD` (`float`) -> majority-decision win rate (`prior_win_by_MD / prior_fights`)
+- `win_by_SD` (`float`) -> split-decision win rate (`prior_win_by_SD / prior_fights`)
+- `win_by_UD` (`float`) -> unanimous-decision win rate (`prior_win_by_UD / prior_fights`)
+- `win_by_KO/TKO` (`float`) -> KO/TKO win rate (`prior_win_by_KO/TKO / prior_fights`)
+- `win_by_SUB` (`float`) -> submission win rate (`prior_win_by_SUB / prior_fights`)

@@ -167,7 +167,8 @@ class UFCRawDataScraper:
 
     def clean_data_csv(self) -> None:
         """
-        Remove matchup rows where either fighter is missing required profile fields.
+        Remove matchup rows where either fighter is missing required profile
+        fields, and drop rows where either fighter is making their debut.
         """
         if not FINAL_DATA_PATH.exists():
             print(f"No existing {FINAL_DATA_PATH} to clean.")
@@ -200,13 +201,17 @@ class UFCRawDataScraper:
             df["R_stance"].fillna("").astype(str).str.strip().ne("")
             & df["B_stance"].fillna("").astype(str).str.strip().ne("")
         )
-        # Drop rows where both fighters are debuting (inferred by zero total fight time).
-        both_debut = (
-            pd.to_numeric(df["R_total_time_fought_seconds"], errors="coerce").fillna(0).eq(0)
-            & pd.to_numeric(df["B_total_time_fought_seconds"], errors="coerce").fillna(0).eq(0)
+        # Drop rows where either fighter is debuting (inferred by zero total fight time).
+        either_debut = (
+            pd.to_numeric(df["R_total_time_fought_seconds"], errors="coerce")
+            .fillna(0)
+            .eq(0)
+            | pd.to_numeric(df["B_total_time_fought_seconds"], errors="coerce")
+            .fillna(0)
+            .eq(0)
         )
 
-        cleaned = df[reach_ok & height_ok & age_ok & stance_ok & (~both_debut)].reset_index(
+        cleaned = df[reach_ok & height_ok & age_ok & stance_ok & (~either_debut)].reset_index(
             drop=True
         )
         # Ages are required above, so cast them to integer type.
@@ -1019,6 +1024,15 @@ class UFCRawDataScraper:
     def _add_history_features(
         self, out_row: Dict, prefix: str, hist: FighterHistory, stat_bases: List[str]
     ) -> None:
+        total_fights = hist.fights
+
+        def as_rate(count: int) -> float:
+            # Convert cumulative counts to pre-fight rates to reduce
+            # model bias toward fighters with larger career sample sizes.
+            if total_fights <= 0:
+                return 0.0
+            return count / total_fights
+
         for base in stat_bases:
             out_row[f"{prefix}_avg_{base}"] = self._avg_or_nan(
                 hist.hero_sum[base], hist.hero_count[base]
@@ -1029,16 +1043,16 @@ class UFCRawDataScraper:
 
         out_row[f"{prefix}_current_lose_streak"] = hist.current_lose_streak
         out_row[f"{prefix}_current_win_streak"] = hist.current_win_streak
-        out_row[f"{prefix}_draws"] = hist.draws
-        out_row[f"{prefix}_wins"] = hist.wins
-        out_row[f"{prefix}_losses"] = hist.losses
+        out_row[f"{prefix}_draws"] = as_rate(hist.draws)
+        out_row[f"{prefix}_wins"] = as_rate(hist.wins)
+        out_row[f"{prefix}_losses"] = as_rate(hist.losses)
         out_row[f"{prefix}_total_time_fought_seconds"] = hist.total_time_fought_seconds
-        out_row[f"{prefix}_total_title_bouts"] = hist.total_title_bouts
-        out_row[f"{prefix}_win_by_MD"] = hist.win_by_MD
-        out_row[f"{prefix}_win_by_SD"] = hist.win_by_SD
-        out_row[f"{prefix}_win_by_UD"] = hist.win_by_UD
-        out_row[f"{prefix}_win_by_KO/TKO"] = hist.win_by_KO
-        out_row[f"{prefix}_win_by_SUB"] = hist.win_by_SUB
+        out_row[f"{prefix}_total_title_bouts"] = as_rate(hist.total_title_bouts)
+        out_row[f"{prefix}_win_by_MD"] = as_rate(hist.win_by_MD)
+        out_row[f"{prefix}_win_by_SD"] = as_rate(hist.win_by_SD)
+        out_row[f"{prefix}_win_by_UD"] = as_rate(hist.win_by_UD)
+        out_row[f"{prefix}_win_by_KO/TKO"] = as_rate(hist.win_by_KO)
+        out_row[f"{prefix}_win_by_SUB"] = as_rate(hist.win_by_SUB)
 
     def _estimate_fight_seconds(self, row) -> int:
         """
