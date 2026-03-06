@@ -18,7 +18,7 @@
 ## Install
 
 ```bash
-pip install pandas numpy requests beautifulsoup4 tqdm
+pip install pandas numpy requests beautifulsoup4 tqdm scikit-learn
 ```
 
 ## Run
